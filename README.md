@@ -3,7 +3,7 @@
 An interactive web dashboard for exploring flow cytometry data. Upload an `.fcs` file, pick any two markers to plot against each other, and view automated K-Means gating with a live-updating scatter plot, color-coded clusters, and per-population statistics.
 
 ![Dashboard Screenshot](./docs/screenshot.png)
-*(Replace this with a real screenshot of the running dashboard — upload a sample `.fcs` file and capture the scatter plot + legend panel.)*
+
 
 ## Features
 
