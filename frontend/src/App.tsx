@@ -15,6 +15,11 @@ const CLUSTER_METADATA = [
   { name: "Cluster 4: Debris / Platelets", color: '#8b5cf6', desc: "Low forward scatter baseline particulate matter" },
 ];
 
+// Shared style for <option> elements. Note: many browsers (esp. Chromium)
+// render the OPEN dropdown list using native OS styling and ignore color/background
+// set on <select> alone — that's what was causing "black text on grey" in the
+// dropdown popup even though the closed box looked fine. Setting colorScheme:'dark'
+// on the <select> plus explicit styles on <option> fixes this reliably.
 const optionStyle: React.CSSProperties = { background: '#2a2a2a', color: '#ffffff' };
 const selectStyle: React.CSSProperties = {
   padding: '6px',
@@ -37,6 +42,9 @@ const CustomTooltip = ({ active, payload }: any) => {
   return null;
 };
 
+// Compact color-key legend for the dots directly on the chart, per request:
+// explains what the green / orange / blue dots mean without needing to read
+// the full statistics panel.
 const ChartLegend = ({ activeClusters }: { activeClusters: number[] }) => (
   <div style={{ display: 'flex', gap: '18px', flexWrap: 'wrap', justifyContent: 'center', marginTop: '10px' }}>
     {activeClusters.map((idx) => {
@@ -65,11 +73,18 @@ export default function App() {
 
   const [isLoading, setIsLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [clusterMode, setClusterMode] = useState<'all' | 'selected'>('all');
 
   const fetchData = useCallback(async () => {
     const file = fileRef.current?.files?.[0];
     if (!file) {
       setErrorMsg("Please upload an .fcs file before plotting.");
+      return;
+    }
+
+    if (!file.name.toLowerCase().endsWith('.fcs')) {
+      setErrorMsg(`"${file.name}" doesn't look like an .fcs file. Please choose a valid FCS file exported from your cytometer.`);
+      setData([]);
       return;
     }
 
@@ -79,12 +94,20 @@ export default function App() {
     const xSel = xRef.current ? parseInt(xRef.current.value, 10) : xIndex;
     const ySel = yRef.current ? parseInt(yRef.current.value, 10) : yIndex;
 
+    // Backend expects marker NAMES in a "markers" field. Read the marker name
+    // directly off the selected <option>'s text rather than indexing into the
+    // "columns" state — fetchData is memoized on [xIndex, yIndex] only, so a
+    // closure that reads "columns" here can capture a STALE copy of that array
+    // from an earlier render, silently sending the same marker names every
+    // time regardless of what's picked in the dropdown. Reading straight from
+    // the DOM avoids that staleness entirely.
     const xMarker = xRef.current?.options[xRef.current.selectedIndex]?.text || columns[xSel] || "FSC-A";
     const yMarker = yRef.current?.options[yRef.current.selectedIndex]?.text || columns[ySel] || "SSC-A";
 
     const formData = new FormData();
     formData.append("file", file);
     formData.append("markers", `${xMarker},${yMarker}`);
+    formData.append("cluster_mode", clusterMode);
 
     try {
       const res = await fetch("http://localhost:8000/api/cluster", {
@@ -114,7 +137,7 @@ export default function App() {
     } finally {
       setIsLoading(false);
     }
-  }, [xIndex, yIndex]);
+  }, [xIndex, yIndex, clusterMode]);
 
   useEffect(() => {
     if (fileRef.current?.files?.length) {
@@ -131,6 +154,7 @@ export default function App() {
     return acc;
   }, {} as Record<number, number>);
 
+  // Which clusters actually appear in the current dataset — drives the compact legend.
   const activeClusters = Object.keys(clusterCounts)
     .map(Number)
     .sort((a, b) => a - b);
@@ -139,6 +163,7 @@ export default function App() {
     <div style={{ padding: '2rem', background: '#121212', color: '#fff', minHeight: '100vh', fontFamily: 'sans-serif' }}>
       <h1 style={{ marginBottom: '1rem', fontSize: '1.8rem', fontWeight: 'bold' }}>Clinical Cytometry Dashboard</h1>
 
+      {/* Control Panel */}
       <div style={{ padding: '1rem', background: '#1e1e1e', borderRadius: '8px', marginBottom: '1rem', display: 'flex', gap: '15px', alignItems: 'center', flexWrap: 'wrap' }}>
         <div>
           <label style={{ fontSize: '12px', color: '#aaa', display: 'block', marginBottom: '4px' }}>Upload Data (.fcs):</label>
@@ -185,6 +210,22 @@ export default function App() {
           </select>
         </div>
 
+        <div>
+          <label style={{ fontSize: '12px', color: '#aaa', display: 'block', marginBottom: '4px' }}>Clustering:</label>
+          <select
+            value={clusterMode}
+            onChange={(e) => {
+              setClusterMode(e.target.value as 'all' | 'selected');
+              fetchData();
+            }}
+            style={selectStyle}
+            title="'All channels' clusters using every marker in the file, so colors stay consistent as you switch axes but may look scattered on any single 2D view. 'Selected axes only' re-clusters using just the two markers currently shown, so it always looks visually clean but cluster identities change each time you switch axes."
+          >
+            <option value="all" style={optionStyle}>All Channels</option>
+            <option value="selected" style={optionStyle}>Selected Axes Only</option>
+          </select>
+        </div>
+
         <button
           onClick={fetchData}
           disabled={isLoading}
@@ -209,8 +250,10 @@ export default function App() {
         </div>
       )}
 
+      {/* Main Layout Grid: Chart + Biological Gating Legend */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 340px', gap: '20px', alignItems: 'start' }}>
 
+        {/* Chart Section */}
         <div style={{ background: '#1e1e1e', padding: '20px', borderRadius: '8px', height: '540px', display: 'flex', flexDirection: 'column' }}>
           {data.length > 0 ? (
             <>
@@ -220,7 +263,10 @@ export default function App() {
                     <CartesianGrid stroke="#333" />
                     <XAxis type="number" dataKey="x" name={currentLabelX} domain={['auto', 'auto']} stroke="#888" />
                     <YAxis type="number" dataKey="y" name={currentLabelY} domain={['auto', 'auto']} stroke="#888" />
+
+                    {/* High Contrast Custom Tooltip */}
                     <Tooltip content={<CustomTooltip />} cursor={{ strokeDasharray: '3 3' }} />
+
                     <Scatter data={data}>
                       {data.map((entry, index) => {
                         const colorIndex = entry.cluster % CLUSTER_METADATA.length;
@@ -230,6 +276,7 @@ export default function App() {
                   </ScatterChart>
                 </ResponsiveContainer>
               </div>
+              {/* Compact dot-color legend, requested explicitly */}
               <ChartLegend activeClusters={activeClusters} />
             </>
           ) : (
@@ -239,12 +286,14 @@ export default function App() {
           )}
         </div>
 
+        {/* Biological Gating Legend & Statistics Panel */}
         <div style={{ background: '#1e1e1e', padding: '20px', borderRadius: '8px', border: '1px solid #333' }}>
           <h3 style={{ fontSize: '15px', fontWeight: 'bold', marginBottom: '12px', borderBottom: '1px solid #333', paddingBottom: '8px', color: '#fff' }}>
             Automated Gating Legend
           </h3>
           <p style={{ fontSize: '11px', color: '#aaa', marginBottom: '14px' }}>
-            Unsupervised K-Means clustering identifies distinct cellular subpopulations:
+            Unsupervised K-Means clustering identifies distinct cellular subpopulations
+            {' '}({clusterMode === 'all' ? 'based on all channels' : 'based on the two selected axes'}):
           </p>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
