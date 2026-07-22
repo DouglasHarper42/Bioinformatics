@@ -166,8 +166,9 @@ export default function App() {
       {/* Control Panel */}
       <div style={{ padding: '1rem', background: '#1e1e1e', borderRadius: '8px', marginBottom: '1rem', display: 'flex', gap: '15px', alignItems: 'center', flexWrap: 'wrap' }}>
         <div>
-          <label style={{ fontSize: '12px', color: '#aaa', display: 'block', marginBottom: '4px' }}>Upload Data (.fcs):</label>
+          <label htmlFor="fcs-file-input" style={{ fontSize: '12px', color: '#aaa', display: 'block', marginBottom: '4px' }}>Upload Data (.fcs):</label>
           <input
+            id="fcs-file-input"
             type="file"
             accept=".fcs"
             ref={fileRef}
@@ -177,8 +178,9 @@ export default function App() {
         </div>
 
         <div>
-          <label style={{ fontSize: '12px', color: '#aaa', display: 'block', marginBottom: '4px' }}>X-Axis Marker:</label>
+          <label htmlFor="x-axis-select" style={{ fontSize: '12px', color: '#aaa', display: 'block', marginBottom: '4px' }}>X-Axis Marker:</label>
           <select
+            id="x-axis-select"
             ref={xRef}
             value={xIndex}
             onChange={(e) => {
@@ -194,8 +196,9 @@ export default function App() {
         </div>
 
         <div>
-          <label style={{ fontSize: '12px', color: '#aaa', display: 'block', marginBottom: '4px' }}>Y-Axis Marker:</label>
+          <label htmlFor="y-axis-select" style={{ fontSize: '12px', color: '#aaa', display: 'block', marginBottom: '4px' }}>Y-Axis Marker:</label>
           <select
+            id="y-axis-select"
             ref={yRef}
             value={yIndex}
             onChange={(e) => {
@@ -211,8 +214,9 @@ export default function App() {
         </div>
 
         <div>
-          <label style={{ fontSize: '12px', color: '#aaa', display: 'block', marginBottom: '4px' }}>Clustering:</label>
+          <label htmlFor="cluster-mode-select" style={{ fontSize: '12px', color: '#aaa', display: 'block', marginBottom: '4px' }}>Clustering:</label>
           <select
+            id="cluster-mode-select"
             value={clusterMode}
             onChange={(e) => {
               setClusterMode(e.target.value as 'all' | 'selected');
