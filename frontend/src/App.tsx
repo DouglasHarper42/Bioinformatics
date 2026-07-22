@@ -7,6 +7,15 @@ interface CellEvent {
   cluster: number;
 }
 
+interface BatchResult {
+  filename: string;
+  columns?: string[];
+  data?: CellEvent[];
+  error?: string;
+  totalEvents: number;
+  clusterCounts: Record<number, number>;
+}
+
 const CLUSTER_METADATA = [
   { name: "Cluster 0: Lymphocytes (Blue)", color: '#3b82f6', desc: "Small, low complexity cells (T-cells, B-cells, NK cells)" },
   { name: "Cluster 1: Monocytes (Green)", color: '#10b981', desc: "Larger, moderately complex mononuclear leukocytes" },
@@ -61,7 +70,6 @@ const ChartLegend = ({ activeClusters }: { activeClusters: number[] }) => (
 );
 
 export default function App() {
-  const [data, setData] = useState<CellEvent[]>([]);
   const [columns, setColumns] = useState<string[]>(["FSC-A", "SSC-A"]);
   const [chartKey, setChartKey] = useState(0);
   const [xIndex, setXIndex] = useState<number>(0);
@@ -75,75 +83,139 @@ export default function App() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [clusterMode, setClusterMode] = useState<'all' | 'selected'>('all');
 
-  const fetchData = useCallback(async () => {
-    const file = fileRef.current?.files?.[0];
-    if (!file) {
-      setErrorMsg("Please upload an .fcs file before plotting.");
-      return;
-    }
+  // Batch upload support: multiple files can be selected at once. Each gets
+  // its own entry in batchResults (success or error), and activeFileIndex
+  // controls which one's data currently feeds the chart. selectedFiles is
+  // kept in state (not just read once from the <input>) so that changing the
+  // axis/cluster-mode selectors can re-run the SAME set of files without
+  // requiring the user to re-pick them.
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [batchResults, setBatchResults] = useState<BatchResult[]>([]);
+  const [activeFileIndex, setActiveFileIndex] = useState<number | null>(null);
 
-    if (!file.name.toLowerCase().endsWith('.fcs')) {
-      setErrorMsg(`"${file.name}" doesn't look like an .fcs file. Please choose a valid FCS file exported from your cytometer.`);
-      setData([]);
-      return;
-    }
+  const activeResult = activeFileIndex !== null ? batchResults[activeFileIndex] : undefined;
+  const data = activeResult?.data ?? [];
 
-    setIsLoading(true);
-    setErrorMsg(null);
+  // Uploads and clusters a single file, returning a BatchResult regardless
+  // of success or failure (never throws) so the batch loop below can
+  // continue processing remaining files even if one fails.
+  const uploadOne = useCallback(
+    async (file: File, xMarker: string, yMarker: string): Promise<BatchResult> => {
+      if (!file.name.toLowerCase().endsWith('.fcs')) {
+        return {
+          filename: file.name,
+          error: `"${file.name}" doesn't look like an .fcs file. Please choose a valid FCS file exported from your cytometer.`,
+          totalEvents: 0,
+          clusterCounts: {},
+        };
+      }
 
-    const xSel = xRef.current ? parseInt(xRef.current.value, 10) : xIndex;
-    const ySel = yRef.current ? parseInt(yRef.current.value, 10) : yIndex;
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("markers", `${xMarker},${yMarker}`);
+      formData.append("cluster_mode", clusterMode);
 
-    // Backend expects marker NAMES in a "markers" field. Read the marker name
-    // directly off the selected <option>'s text rather than indexing into the
-    // "columns" state — fetchData is memoized on [xIndex, yIndex] only, so a
-    // closure that reads "columns" here can capture a STALE copy of that array
-    // from an earlier render, silently sending the same marker names every
-    // time regardless of what's picked in the dropdown. Reading straight from
-    // the DOM avoids that staleness entirely.
-    const xMarker = xRef.current?.options[xRef.current.selectedIndex]?.text || columns[xSel] || "FSC-A";
-    const yMarker = yRef.current?.options[yRef.current.selectedIndex]?.text || columns[ySel] || "SSC-A";
+      try {
+        const res = await fetch("http://localhost:8000/api/cluster", {
+          method: "POST",
+          body: formData,
+        });
 
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("markers", `${xMarker},${yMarker}`);
-    formData.append("cluster_mode", clusterMode);
+        if (!res.ok) throw new Error(`Server returned status ${res.status}`);
 
-    try {
-      const res = await fetch("http://localhost:8000/api/cluster", {
-        method: "POST",
-        body: formData,
-      });
+        const json = await res.json();
+        if (json.error) throw new Error(json.error);
 
-      if (!res.ok) throw new Error(`Server returned status ${res.status}`);
+        const resultColumns: string[] | undefined = json.columns;
+        const resultData: CellEvent[] = json.columns && json.data ? json.data : json;
 
-      const json = await res.json();
-      if (json.error) throw new Error(json.error);
+        const clusterCounts = resultData.reduce((acc, curr) => {
+          acc[curr.cluster] = (acc[curr.cluster] || 0) + 1;
+          return acc;
+        }, {} as Record<number, number>);
 
-      if (json.columns && json.data) {
-        setColumns(json.columns);
-        setData(json.data);
-      } else {
-        setData(json);
+        return {
+          filename: file.name,
+          columns: resultColumns,
+          data: resultData,
+          totalEvents: resultData.length,
+          clusterCounts,
+        };
+      } catch (err: any) {
+        console.error("Fetch error:", err);
+        return {
+          filename: file.name,
+          error: err.message || "An unknown error occurred during clustering.",
+          totalEvents: 0,
+          clusterCounts: {},
+        };
+      }
+    },
+    [clusterMode]
+  );
+
+  // Processes every file in `files` against the currently selected axes and
+  // clustering mode. Runs sequentially (not Promise.all) so a batch of large
+  // files doesn't hammer the backend with simultaneous clustering jobs.
+  const processFiles = useCallback(
+    async (files: File[]) => {
+      if (files.length === 0) {
+        setErrorMsg("Please upload at least one .fcs file before plotting.");
+        return;
+      }
+
+      setIsLoading(true);
+      setErrorMsg(null);
+
+      const xSel = xRef.current ? parseInt(xRef.current.value, 10) : xIndex;
+      const ySel = yRef.current ? parseInt(yRef.current.value, 10) : yIndex;
+      const xMarker = xRef.current?.options[xRef.current.selectedIndex]?.text || columns[xSel] || "FSC-A";
+      const yMarker = yRef.current?.options[yRef.current.selectedIndex]?.text || columns[ySel] || "SSC-A";
+
+      const results: BatchResult[] = [];
+      for (const file of files) {
+        const result = await uploadOne(file, xMarker, yMarker);
+        results.push(result);
+        // Update progressively so a large batch shows results as they land
+        // rather than all at once at the end.
+        setBatchResults([...results]);
+      }
+
+      const firstSuccessIndex = results.findIndex(r => !r.error);
+      setActiveFileIndex(firstSuccessIndex !== -1 ? firstSuccessIndex : 0);
+
+      if (firstSuccessIndex !== -1 && results[firstSuccessIndex].columns) {
+        setColumns(results[firstSuccessIndex].columns!);
+      }
+
+      const allFailed = results.every(r => r.error);
+      if (allFailed) {
+        setErrorMsg(results.length === 1 ? results[0].error! : `All ${results.length} files failed to process. See the table below for details.`);
+      } else if (results.some(r => r.error)) {
+        setErrorMsg(`${results.filter(r => r.error).length} of ${results.length} file(s) failed. See the table below for details.`);
       }
 
       setXIndex(xSel);
       setYIndex(ySel);
       setChartKey(prev => prev + 1);
-    } catch (err: any) {
-      console.error("Fetch error:", err);
-      setErrorMsg(err.message || "An unknown error occurred during clustering.");
-      setData([]);
-    } finally {
       setIsLoading(false);
-    }
-  }, [xIndex, yIndex, clusterMode]);
+    },
+    [xIndex, yIndex, columns, uploadOne]
+  );
 
-  useEffect(() => {
-    if (fileRef.current?.files?.length) {
-      fetchData();
+  const handleFileSelection = useCallback(() => {
+    const files = fileRef.current?.files ? Array.from(fileRef.current.files) : [];
+    setSelectedFiles(files);
+    processFiles(files);
+  }, [processFiles]);
+
+  // Re-run the current batch (if any files are selected) whenever the axis
+  // or clustering mode selectors change.
+  const rerunCurrentBatch = useCallback(() => {
+    if (selectedFiles.length > 0) {
+      processFiles(selectedFiles);
     }
-  }, [fetchData]);
+  }, [selectedFiles, processFiles]);
 
   const currentLabelX = columns[xIndex] || "X-Axis";
   const currentLabelY = columns[yIndex] || "Y-Axis";
@@ -166,13 +238,14 @@ export default function App() {
       {/* Control Panel */}
       <div style={{ padding: '1rem', background: '#1e1e1e', borderRadius: '8px', marginBottom: '1rem', display: 'flex', gap: '15px', alignItems: 'center', flexWrap: 'wrap' }}>
         <div>
-          <label htmlFor="fcs-file-input" style={{ fontSize: '12px', color: '#aaa', display: 'block', marginBottom: '4px' }}>Upload Data (.fcs):</label>
+          <label htmlFor="fcs-file-input" style={{ fontSize: '12px', color: '#aaa', display: 'block', marginBottom: '4px' }}>Upload Data (.fcs, multiple allowed):</label>
           <input
             id="fcs-file-input"
             type="file"
             accept=".fcs"
+            multiple
             ref={fileRef}
-            onChange={fetchData}
+            onChange={handleFileSelection}
             style={{ background: '#333', color: '#fff', padding: '4px', borderRadius: '4px', colorScheme: 'dark' }}
           />
         </div>
@@ -185,7 +258,7 @@ export default function App() {
             value={xIndex}
             onChange={(e) => {
               setXIndex(parseInt(e.target.value, 10));
-              fetchData();
+              rerunCurrentBatch();
             }}
             style={selectStyle}
           >
@@ -203,7 +276,7 @@ export default function App() {
             value={yIndex}
             onChange={(e) => {
               setYIndex(parseInt(e.target.value, 10));
-              fetchData();
+              rerunCurrentBatch();
             }}
             style={selectStyle}
           >
@@ -220,7 +293,7 @@ export default function App() {
             value={clusterMode}
             onChange={(e) => {
               setClusterMode(e.target.value as 'all' | 'selected');
-              fetchData();
+              rerunCurrentBatch();
             }}
             style={selectStyle}
             title="'All channels' clusters using every marker in the file, so colors stay consistent as you switch axes but may look scattered on any single 2D view. 'Selected axes only' re-clusters using just the two markers currently shown, so it always looks visually clean but cluster identities change each time you switch axes."
@@ -231,7 +304,7 @@ export default function App() {
         </div>
 
         <button
-          onClick={fetchData}
+          onClick={rerunCurrentBatch}
           disabled={isLoading}
           style={{
             background: isLoading ? '#555' : '#3b82f6',
@@ -251,6 +324,48 @@ export default function App() {
       {errorMsg && (
         <div style={{ background: 'rgba(239, 68, 68, 0.2)', border: '1px solid #ef4444', color: '#ff8a8a', padding: '12px', borderRadius: '6px', marginBottom: '1rem' }}>
           <strong>Error:</strong> {errorMsg}
+        </div>
+      )}
+
+      {batchResults.length > 1 && (
+        <div style={{ background: '#1e1e1e', borderRadius: '8px', marginBottom: '1rem', overflow: 'hidden' }}>
+          <div style={{ padding: '12px 16px', borderBottom: '1px solid #333', fontSize: '13px', fontWeight: 'bold', color: '#fff' }}>
+            Batch Results ({batchResults.filter(r => !r.error).length} of {batchResults.length} processed successfully) — click a row to view its chart
+          </div>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px' }}>
+            <thead>
+              <tr style={{ color: '#aaa', textAlign: 'left' }}>
+                <th style={{ padding: '8px 16px' }}>File</th>
+                <th style={{ padding: '8px 16px' }}>Status</th>
+                <th style={{ padding: '8px 16px' }}>Events</th>
+              </tr>
+            </thead>
+            <tbody>
+              {batchResults.map((result, idx) => (
+                <tr
+                  key={`${result.filename}-${idx}`}
+                  onClick={() => {
+                    if (!result.error) {
+                      setActiveFileIndex(idx);
+                      if (result.columns) setColumns(result.columns);
+                      setChartKey(prev => prev + 1);
+                    }
+                  }}
+                  style={{
+                    cursor: result.error ? 'default' : 'pointer',
+                    background: idx === activeFileIndex ? '#2a2a2a' : 'transparent',
+                    borderTop: '1px solid #2a2a2a',
+                  }}
+                >
+                  <td style={{ padding: '8px 16px', color: '#fff' }}>{result.filename}</td>
+                  <td style={{ padding: '8px 16px', color: result.error ? '#ff8a8a' : '#4ade80' }}>
+                    {result.error ? `Error: ${result.error}` : 'Success'}
+                  </td>
+                  <td style={{ padding: '8px 16px', color: '#ccc' }}>{result.error ? '—' : result.totalEvents.toLocaleString()}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
 

@@ -140,3 +140,143 @@ describe('App - successful upload flow', () => {
     expect(screen.getByText(/upload an \.fcs file and select markers to view/i)).toBeInTheDocument();
   });
 });
+
+describe('App - batch upload', () => {
+  it('processes multiple files and shows a batch results table with per-file status', async () => {
+    const fetchMock = vi.fn().mockImplementation(async (_url, options) => {
+      const formData = options.body as FormData;
+      const file = formData.get('file') as File;
+      if (file.name === 'good1.fcs') {
+        return {
+          ok: true,
+          json: async () => ({
+            columns: ['FSC-A', 'SSC-A'],
+            data: [{ x: 1, y: 2, cluster: 0 }, { x: 2, y: 3, cluster: 1 }],
+          }),
+        };
+      }
+      if (file.name === 'good2.fcs') {
+        return {
+          ok: true,
+          json: async () => ({
+            columns: ['FSC-A', 'SSC-A'],
+            data: [{ x: 4, y: 5, cluster: 0 }],
+          }),
+        };
+      }
+      return { ok: true, json: async () => ({ error: 'This file could not be read as a valid FCS file.' }) };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    const user = userEvent.setup();
+
+    const fileInput = screen.getByLabelText(/upload data/i) as HTMLInputElement;
+    await user.upload(fileInput, [
+      makeFile('good1.fcs'),
+      makeFile('good2.fcs'),
+      makeFile('bad.fcs'),
+    ]);
+
+    await waitFor(() => {
+      expect(screen.getByText(/batch results/i)).toBeInTheDocument();
+    });
+
+    expect(screen.getByText('good1.fcs')).toBeInTheDocument();
+    expect(screen.getByText('good2.fcs')).toBeInTheDocument();
+    expect(screen.getByText('bad.fcs')).toBeInTheDocument();
+
+    expect(screen.getByText(/2 of 3 processed successfully/i)).toBeInTheDocument();
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+
+    expect(screen.getByText(/total analyzed events: 2/i)).toBeInTheDocument();
+  });
+
+  it('client-side rejects non-.fcs files within a batch WITHOUT calling fetch for them', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ columns: ['FSC-A', 'SSC-A'], data: [{ x: 1, y: 1, cluster: 0 }] }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    const fileInput = screen.getByLabelText(/upload data/i) as HTMLInputElement;
+
+    // userEvent.upload() would silently filter notes.txt out due to the
+    // input's accept=".fcs" attribute (real picker behavior) — bypass that
+    // here since we're testing what happens when a mismatched file DOES
+    // make it through (e.g. user chose "All Files" in their OS dialog).
+    Object.defineProperty(fileInput, 'files', {
+      value: [makeFile('good.fcs'), makeFile('notes.txt')],
+      writable: true,
+      configurable: true,
+    });
+    act(() => {
+      fireEvent.change(fileInput);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText(/batch results/i)).toBeInTheDocument();
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    expect(screen.getByText('notes.txt')).toBeInTheDocument();
+    expect(screen.getByText(/doesn't look like an \.fcs file/i)).toBeInTheDocument();
+  });
+
+  it('clicking a different row in the batch table switches the active chart data', async () => {
+    const fetchMock = vi.fn().mockImplementation(async (_url, options) => {
+      const formData = options.body as FormData;
+      const file = formData.get('file') as File;
+      const eventCount = file.name === 'first.fcs' ? 5 : 9;
+      return {
+        ok: true,
+        json: async () => ({
+          columns: ['FSC-A', 'SSC-A'],
+          data: Array.from({ length: eventCount }, (_, i) => ({ x: i, y: i, cluster: 0 })),
+        }),
+      };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    const user = userEvent.setup();
+
+    const fileInput = screen.getByLabelText(/upload data/i) as HTMLInputElement;
+    await user.upload(fileInput, [makeFile('first.fcs'), makeFile('second.fcs')]);
+
+    await waitFor(() => {
+      expect(screen.getByText(/total analyzed events: 5/i)).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByText('second.fcs'));
+
+    await waitFor(() => {
+      expect(screen.getByText(/total analyzed events: 9/i)).toBeInTheDocument();
+    });
+  });
+
+  it('does not show the batch table for a single-file upload', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ columns: ['FSC-A', 'SSC-A'], data: [{ x: 1, y: 1, cluster: 0 }] }),
+      })
+    );
+
+    render(<App />);
+    const user = userEvent.setup();
+
+    const fileInput = screen.getByLabelText(/upload data/i) as HTMLInputElement;
+    await user.upload(fileInput, makeFile('sample.fcs'));
+
+    await waitFor(() => {
+      expect(screen.getByText(/automated gating legend/i)).toBeInTheDocument();
+    });
+
+    expect(screen.queryByText(/batch results/i)).not.toBeInTheDocument();
+  });
+});
