@@ -10,6 +10,7 @@ An interactive web dashboard for exploring flow cytometry data. Upload an `.fcs`
 - **Drag-and-drop `.fcs` upload** with clear validation (rejects non-FCS files with a helpful error instead of failing silently)
 - **Configurable X/Y axes** — choose any two channels detected in the uploaded file (forward/side scatter, fluorescence channels, etc.)
 - **Automated gating** via K-Means clustering (scikit-learn), with clusters mapped to common leukocyte populations (lymphocytes, monocytes, granulocytes)
+- **Two clustering modes**: cluster on all channels at once (consistent populations across every view) or on just the two currently-selected axes (visually clean groupings for any pair, at the cost of consistency across views)
 - **Arcsinh-transformed** channel data, the standard transformation for flow cytometry visualization
 - **Live statistics panel** showing per-cluster event counts and percentages
 - **Downsampling** to 3,000 events for smooth rendering on high-event clinical files
@@ -97,6 +98,17 @@ cytometry-pipeline/
     └── package.json
 ```
 
+## Testing
+
+The backend has a pytest suite covering file validation, axis-switching correctness, downsampling, and both clustering modes:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests/ -v
+```
+
+Tests run automatically on every push and pull request via GitHub Actions (see `.github/workflows/backend-tests.yml`).
+
 ## API
 
 ### `POST /api/cluster`
@@ -123,7 +135,27 @@ On invalid input (wrong file type, unparseable FCS file), returns:
 
 ## Notes on Clustering
 
-Cluster assignment is computed via unsupervised K-Means (`k=3`) across **all** numeric channels in the file, not just the two currently plotted on X/Y. This means the color-coded populations represent the overall cellular subpopulations in the sample, and stay consistent as you switch which two channels you're viewing — but it also means the cluster boundaries won't align with a 2D decision boundary on any single axis pair.
+Cluster assignment is computed via unsupervised K-Means (`k=3`) across **all** numeric channels in the file by default, not just the two currently plotted on X/Y. This means the color-coded populations represent the overall cellular subpopulations in the sample, and stay consistent as you switch which two channels you're viewing — but it also means the cluster boundaries won't align with a 2D decision boundary on any single axis pair. An alternate "Selected Axes Only" mode is available that clusters using just the two currently plotted channels instead, which will always look visually clean on whatever axes are shown, at the cost of cluster identities changing each time you switch axes.
+
+**Known limitations of the current approach**, and what a production version would need instead:
+
+- **K-Means assumes spherical, evenly-sized clusters.** Real immune cell populations are rarely that clean — they overlap, have very different sizes, and can have irregular/elongated shapes in high-dimensional marker space. Density-based methods (DBSCAN, or cytometry-specific tools like FlowSOM) or Gaussian Mixture Models handle this more realistically.
+- **`k=3` is hardcoded.** A real gating pipeline needs to either determine the number of populations dynamically (e.g. via silhouette score, BIC/AIC for GMMs) or support hierarchical/sequential gating, where an analyst progressively gates sub-populations out of larger ones — which is how gating is actually done in practice, rather than a single flat clustering pass.
+- **No compensation/spillover correction.** Real fluorescence channels have spectral overlap between fluorochromes that needs to be compensated for before clustering is meaningful; this prototype clusters on raw (arcsinh-transformed) channel values directly.
+- **No batch effect correction.** Comparing across samples/instruments/days in a real clinical pipeline requires normalization methods (e.g. CytoNorm) that this prototype doesn't attempt.
+
+## Scaling & Production Considerations
+
+This project is intentionally scoped as a learning prototype — a single `.fcs` file, processed synchronously, in memory, on one machine. That works fine for exploration but wouldn't hold up at the scale described in a real clinical pipeline (an individual immune profile can contain 100M+ data points, and a lab may be processing many samples per day). Here's what would need to change, roughly in the order I'd tackle them:
+
+1. **Streaming / chunked file reads.** `fcsparser.parse()` currently loads the entire file into memory as a single `pandas.DataFrame`. For very large files, this should instead read in chunks (or use a library/format that supports out-of-core processing) so memory usage doesn't scale linearly with file size.
+2. **Asynchronous, queued processing.** The current `/api/cluster` endpoint blocks the request until clustering finishes. A production version would accept the upload, hand the job to a background worker queue (e.g. Celery + Redis, or a cloud-native equivalent like AWS SQS + Lambda/Batch), and let the client poll or subscribe for results — both for responsiveness and to allow batch processing of multiple samples without blocking the API.
+3. **Object storage instead of local temp files.** Uploaded files are currently written to a local `tempfile` on the container's filesystem. In a multi-instance deployment, that doesn't work — files should go to object storage (e.g. S3) that any worker instance can access.
+4. **Columnar / off-heap data formats for very large datasets.** For genuinely massive high-dimensional cytometry data, tools like Dask or Vaex (or converting to Parquet/Arrow) would let clustering and aggregation happen without pulling everything into RAM at once.
+5. **Horizontal scaling of the clustering step itself.** K-Means over tens of millions of events benefits from a distributed implementation (e.g. Spark MLlib's K-Means, or mini-batch K-Means for a single-machine approximation) rather than scikit-learn's in-memory implementation.
+6. **Observability.** Structured logging, request tracing, and basic metrics (processing time per file, queue depth, error rates) would be essential for something running against active clinical trial data, where a silent failure has real consequences.
+
+None of this is implemented here — the goal of this section is to be explicit about where the current prototype's ceiling is, and what I'd reach for first to raise it.
 
 ---
 
